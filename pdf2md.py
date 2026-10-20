@@ -1,4 +1,5 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 pdf2md.py - Convert PDFs (research papers and general documents) to Markdown.
 
@@ -21,13 +22,15 @@ Install
 Usage
   python pdf2md.py paper.pdf -o out/
   python pdf2md.py papers_dir/ -o out/ --dpi 200 --page-markers
-  python pdf2md.py scan.pdf -o out/ --ocr force --ocr-lang eng
+  python pdf2md.py scan.pdf -o out/ --ocr force --ocr-lang auto
 """
 from __future__ import annotations
 
 import argparse
 import re
 import sys
+import subprocess
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,10 +54,10 @@ MONO_RE = re.compile(r"mono|courier|consolas|menlo|typewriter|cmtt", re.I)
 BOLD_RE = re.compile(r"bold|black|heavy|semibold|demi", re.I)
 ITAL_RE = re.compile(r"italic|oblique", re.I)
 BULLET_RE = re.compile(r"^([•●▪◦‣∙·]|[-–—*])\s+")
-NUM_RE = re.compile(r"^(\d{1,2}[.)]|\([a-z0-9]{1,2}\))\s+")
+NUM_RE = re.compile(r"^(\d{1,3}[.)]|\([^\W_]{1,4}\))\s+", re.UNICODE)
 CAPTION_RE = re.compile(r"^[\*_\s]*(fig(ure)?|table|algorithm|listing)\b\.?\s*\d*", re.I)
 PAGENUM_RE = re.compile(r"^\s*(page\s*)?\d+(\s*(of|/)\s*\d+)?\s*$", re.I)
-TERMINAL = ".!?:;\"”"
+TERMINAL = ".!?:;\"”'…！？。｡؟؛։॥"
 
 
 # --------------------------------------------------------------------------- helpers
@@ -67,7 +70,9 @@ class Item:
 
 
 def clean(s: str) -> str:
-    return s.translate(LIGATURES)
+    # Keep every script intact while composing combining characters consistently.
+    # NFC also avoids visually identical text being written with inconsistent bytes.
+    return unicodedata.normalize("NFC", s).translate(LIGATURES)
 
 
 def norm(s: str) -> str:
@@ -124,6 +129,20 @@ def safe_name(s: str) -> str:
     return re.sub(r"[^\w\-]+", "_", s).strip("_") or "document"
 
 
+
+def installed_ocr_languages() -> list[str]:
+    """Return installed Tesseract language packs suitable for text recognition."""
+    try:
+        result = subprocess.run(
+            ["tesseract", "--list-langs"], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=10, check=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [line.strip() for line in result.stdout.splitlines()
+            if re.fullmatch(r"[\w./-]+", line.strip())
+            and line.strip() not in {"osd", "equ"}]
 # --------------------------------------------------------------------------- span -> markdown
 def block_spans(lines):
     """Flatten lines to spans; join lines with a space, or de-hyphenate."""
@@ -308,6 +327,23 @@ class Converter:
         return bool(PAGENUM_RE.match(txt)) or self._running_key(txt) in self.running
 
     # ---- OCR ---------------------------------------------------------------------
+    def _ocr_language(self) -> str:
+        requested = getattr(self.a, "ocr_lang", "auto").strip()
+        if requested.casefold() != "auto":
+            return requested
+        if not hasattr(self, "_auto_ocr_language"):
+            languages = installed_ocr_languages()
+            if languages:
+                self._auto_ocr_language = "+".join(languages)
+                print(f"  OCR auto: using installed language packs ({self._auto_ocr_language})",
+                      file=sys.stderr)
+            else:
+                # PyMuPDF's OCR backend may still be available without the CLI.
+                self._auto_ocr_language = "eng"
+                print("  ! Could not list Tesseract language packs; OCR auto is falling back to eng",
+                      file=sys.stderr)
+        return self._auto_ocr_language
+
     def _textpage(self, page):
         mode = self.a.ocr
         if mode == "off":
@@ -315,7 +351,7 @@ class Converter:
         few = len(page.get_text().strip()) < 20
         if mode == "force" or (few and page.get_images()):
             try:
-                return page.get_textpage_ocr(language=self.a.ocr_lang, dpi=300, full=True), True
+                return page.get_textpage_ocr(language=self._ocr_language(), dpi=300, full=True), True
             except Exception as e:  # tesseract missing, etc.
                 if not self._ocr_warned:
                     print(f"  ! OCR unavailable ({e}); scanned pages will be saved as images",
@@ -478,7 +514,8 @@ class Converter:
             if round(size) in self.heading_sizes:
                 lvl = min(self.heading_sizes.index(round(size)) + 1, 4)
             elif (all(is_bold(s) for s in spans) and len(lines) <= 2 and len(plain) <= 120
-                  and re.search(r"[A-Za-z]", plain) and not plain.endswith((".", ",", ";"))
+                  and re.search(r"[^\W\d_]", plain, re.UNICODE)
+                  and not plain.endswith(tuple(TERMINAL))
                   and not BULLET_RE.match(plain)):
                 lvl = max(2, min(len(self.heading_sizes) + 1, 4))
         if lvl:
@@ -641,7 +678,8 @@ def main():
                     help="auto: ruled + booktabs-style detection; lines: ruled only; off")
     ap.add_argument("--ocr", choices=["auto", "off", "force"], default="auto",
                     help="OCR scanned pages with Tesseract (default auto)")
-    ap.add_argument("--ocr-lang", default="eng", help="Tesseract language(s), e.g. eng+deu")
+    ap.add_argument("--ocr-lang", default="auto",
+                    help="auto: use all installed Tesseract packs; or specify codes, e.g. eng+deu")
     ap.add_argument("--page-markers", action="store_true", help="insert <!-- page N --> comments")
     ap.add_argument("--keep-headers", action="store_true", help="keep running headers/footers")
     ap.add_argument("--merge-gap", type=float, default=8, help="merge figure pieces closer than N pt")
