@@ -28,12 +28,15 @@ from __future__ import annotations
 
 import argparse
 import re
+import shutil
 import sys
 import subprocess
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Optional
+from typing import Callable, Optional
 from urllib.parse import quote
 
 try:
@@ -311,12 +314,25 @@ def order_items(items, page_rect):
 
 
 # --------------------------------------------------------------------------- converter
+class PasswordRequired(RuntimeError):
+    """Raised when a PDF needs a password before it can be converted."""
+
+
+class Cancelled(RuntimeError):
+    """Raised when a caller cancels an in-progress conversion."""
+
+
 class Converter:
-    def __init__(self, args):
+    def __init__(self, args, on_event: Optional[Callable[[str], None]] = None,
+                 cancel: Optional[Callable[[], bool]] = None):
         self.a = args
         self._ocr_warned = False
         self._ocr_page = False
+        self._on_event = on_event or (lambda _message: None)
+        self._cancel = cancel or (lambda: False)
 
+    def _event(self, message: str) -> None:
+        self._on_event(message)
     # ---- document-level pre-pass -------------------------------------------------
     def _doc_stats(self, doc):
         sizes, mono, total = Counter(), 0, 0
@@ -375,13 +391,11 @@ class Converter:
             languages = installed_ocr_languages()
             if languages:
                 self._auto_ocr_language = "+".join(languages)
-                print(f"  OCR auto: using installed language packs ({self._auto_ocr_language})",
-                      file=sys.stderr)
+                self._event(f"OCR auto: using installed language packs ({self._auto_ocr_language})")
             else:
                 # PyMuPDF's OCR backend may still be available without the CLI.
                 self._auto_ocr_language = "eng"
-                print("  ! Could not list Tesseract language packs; OCR auto is falling back to eng",
-                      file=sys.stderr)
+                self._event("Warning: could not list Tesseract language packs; OCR is falling back to eng")
         return self._auto_ocr_language
 
     def _textpage(self, page):
@@ -394,8 +408,7 @@ class Converter:
                 return page.get_textpage_ocr(language=self._ocr_language(), dpi=300, full=True), True
             except Exception as e:  # tesseract missing, etc.
                 if not self._ocr_warned:
-                    print(f"  ! OCR unavailable ({e}); scanned pages will be saved as images",
-                          file=sys.stderr)
+                    self._event(f"Warning: OCR unavailable ({e}); scanned pages will be saved as images")
                     self._ocr_warned = True
         return None, False
 
@@ -616,7 +629,7 @@ class Converter:
 
         if nchars < 10:  # scanned page w/o OCR, or a full-page image
             if a.images and (page.get_images() or page.get_drawings()):
-                print(f"  page {pno}: no text layer -> saved as image", file=sys.stderr)
+                self._event(f"Warning: page {pno}: no text layer -> saved as image")
                 return [Item("fig", pr, self._save_clip(page, pr, pno, 1), pno)]
             return []
 
@@ -687,28 +700,37 @@ class Converter:
             out += text
         return out + "\n"
     # ---- public ------------------------------------------------------------------
-    def convert(self, pdf: Path, out_dir: Path) -> Path:
+    def convert(self, pdf: Path, out_dir: Path, password: Optional[str] = None) -> Path:
         doc = pymupdf.open(pdf)
-        if doc.needs_pass:
-            raise RuntimeError("PDF is password protected")
+        if doc.needs_pass and not (password and doc.authenticate(password)):
+            doc.close()
+            raise PasswordRequired("PDF is password protected")
         stem = safe_name(pdf.stem)
         out_dir.mkdir(parents=True, exist_ok=True)
         self.assets = out_dir / f"{stem}_assets"
-        self._doc_stats(doc)
-        self._find_running(doc)
-        self.toc = {(p, norm(t)): l for l, t, p in doc.get_toc(simple=True)}
-
-        items = []
-        for pno, page in enumerate(doc, 1):
-            items += self._page(page, pno)
-        md = self._render(items)
-        out = out_dir / f"{stem}.md"
-        out.write_text(md, encoding="utf-8")
-        nfig = sum(1 for i in items if i.kind == "fig")
-        ntab = sum(1 for i in items if i.kind == "table")
-        print(f"  {len(doc)} pages -> {out}  ({nfig} figures, {ntab} tables)")
-        return out
-
+        try:
+            self._doc_stats(doc)
+            self._find_running(doc)
+            self.toc = {(p, norm(t)): l for l, t, p in doc.get_toc(simple=True)}
+            items = []
+            for pno, page in enumerate(doc, 1):
+                if self._cancel():
+                    raise Cancelled("Conversion cancelled")
+                items += self._page(page, pno)
+            if self._cancel():
+                raise Cancelled("Conversion cancelled")
+            out = out_dir / f"{stem}.md"
+            out.write_text(self._render(items), encoding="utf-8")
+            nfig = sum(1 for i in items if i.kind == "fig")
+            ntab = sum(1 for i in items if i.kind == "table")
+            self._event(f"{len(doc)} pages -> {out}  ({nfig} figures, {ntab} tables)")
+            return out
+        except Exception:
+            if self.assets.exists():
+                shutil.rmtree(self.assets, ignore_errors=True)
+            raise
+        finally:
+            doc.close()
 
 # --------------------------------------------------------------------------- CLI
 def main():
@@ -723,8 +745,8 @@ def main():
                     help="auto: ruled + booktabs-style detection; lines: ruled only; off")
     ap.add_argument("--ocr", choices=["auto", "off", "force"], default="auto",
                     help="OCR scanned pages with Tesseract (default auto)")
-    ap.add_argument("--ocr-lang", default="auto",
-                    help="auto: use all installed Tesseract packs; or specify codes, e.g. eng+deu")
+    ap.add_argument("--ocr-lang", default="eng", help="Tesseract language(s), e.g. eng+deu")
+    ap.add_argument("--password", help="password for an encrypted PDF")
     ap.add_argument("--page-markers", action="store_true", help="insert <!-- page N --> comments")
     ap.add_argument("--keep-headers", action="store_true", help="keep running headers/footers")
     ap.add_argument("--merge-gap", type=float, default=8, help="merge figure pieces closer than N pt")
@@ -747,7 +769,10 @@ def main():
     for pdf in pdfs:
         print(f"Converting {pdf} ...")
         try:
-            Converter(args).convert(pdf, out_dir)
+            Converter(args, on_event=lambda message: print(f"  {message}")).convert(pdf, out_dir, password=args.password)
+        except PasswordRequired:
+            failed += 1
+            print("  ! password required (use --password)", file=sys.stderr)
         except Exception as e:
             failed += 1
             print(f"  ! failed: {e}", file=sys.stderr)

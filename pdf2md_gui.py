@@ -9,7 +9,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from pdf2md import Converter
+from pdf2md import Converter, installed_ocr_languages
 
 
 class Pdf2MdApp(ttk.Frame):
@@ -22,7 +22,7 @@ class Pdf2MdApp(ttk.Frame):
         self.events: queue.Queue[tuple[str, str]] = queue.Queue()
         self.output_dir = tk.StringVar()
         self.ocr = tk.StringVar(value="auto")
-        self.ocr_lang = tk.StringVar(value="auto")
+        self.ocr_lang = tk.StringVar(value="eng")
         self.tables = tk.StringVar(value="auto")
         self.images = tk.BooleanVar(value=True)
         self.dpi = tk.IntVar(value=150)
@@ -70,7 +70,7 @@ class Pdf2MdApp(ttk.Frame):
         ttk.Label(options, text="Figure DPI:").grid(row=1, column=0, pady=(8, 0), sticky="w")
         ttk.Spinbox(options, from_=72, to=600, increment=25, textvariable=self.dpi, width=8).grid(row=1, column=1, padx=(6, 18), pady=(8, 0), sticky="w")
         ttk.Label(options, text="OCR language(s), or auto:").grid(row=1, column=2, pady=(8, 0), sticky="w")
-        ttk.Entry(options, textvariable=self.ocr_lang, width=16).grid(row=1, column=3, columnspan=2, padx=(6, 0), pady=(8, 0), sticky="w")
+        ttk.Combobox(options, textvariable=self.ocr_lang, values=tuple(installed_ocr_languages()) or ("eng",), width=16).grid(row=1, column=3, columnspan=2, padx=(6, 0), pady=(8, 0), sticky="w")
 
         footer = ttk.Frame(self)
         footer.grid(row=4, column=0, pady=(16, 0), sticky="ew")
@@ -121,7 +121,15 @@ class Pdf2MdApp(ttk.Frame):
         if len(stems) != len(set(stems)):
             if not messagebox.askyesno("Matching filenames", "Some selected PDFs have the same name. Their Markdown files may overwrite each other. Continue?"):
                 return
-        args = Namespace(dpi=self.dpi.get(), image_format="png", images=self.images.get(),
+        try:
+            dpi = int(self.dpi.get())
+        except (tk.TclError, ValueError):
+            self.status.set("Figure DPI must be a number from 72 to 600.")
+            return
+        if not 72 <= dpi <= 600:
+            self.status.set("Figure DPI must be between 72 and 600.")
+            return
+        args = Namespace(dpi=dpi, image_format="png", images=self.images.get(),
                          tables=self.tables.get(), ocr=self.ocr.get(), ocr_lang=self.ocr_lang.get().strip() or "auto",
                          page_markers=False, keep_headers=False, merge_gap=8, min_fig=36)
         self._set_busy(True)
