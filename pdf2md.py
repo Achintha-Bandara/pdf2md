@@ -54,7 +54,15 @@ MONO_RE = re.compile(r"mono|courier|consolas|menlo|typewriter|cmtt", re.I)
 BOLD_RE = re.compile(r"bold|black|heavy|semibold|demi", re.I)
 ITAL_RE = re.compile(r"italic|oblique", re.I)
 BULLET_RE = re.compile(r"^([•●▪◦‣∙·]|[-–—*])\s+")
-NUM_RE = re.compile(r"^(\d{1,3}[.)]|\([^\W_]{1,4}\))\s+", re.UNICODE)
+ROMAN_NUMERAL = r"[ivxlcdm]+"
+NUM_RE = re.compile(
+    rf"^(\d{{1,3}}[.)]|(?i:{ROMAN_NUMERAL})[.)]|\((?:\d{{1,3}}|(?i:{ROMAN_NUMERAL})|[^\W_])\))\s+",
+    re.UNICODE,
+)
+ORDERED_MARKER_RE = re.compile(
+    rf"(?:\d{{1,3}}[.)]|(?i:{ROMAN_NUMERAL})[.)]|\((?:\d{{1,3}}|(?i:{ROMAN_NUMERAL}))\))",
+    re.UNICODE,
+)
 CAPTION_RE = re.compile(r"^[\*_\s]*(fig(ure)?|table|algorithm|listing)\b\.?\s*\d*", re.I)
 PAGENUM_RE = re.compile(r"^\s*(page\s*)?\d+(\s*(of|/)\s*\d+)?\s*$", re.I)
 TERMINAL = ".!?:;\"”'…！？。｡؟؛։॥"
@@ -127,6 +135,38 @@ def merge_rects(tagged, pad):
 
 def safe_name(s: str) -> str:
     return re.sub(r"[^\w\-]+", "_", s).strip("_") or "document"
+def ordered_marker_number(marker: str) -> int | None:
+    """Return the numeric value of an Arabic or Roman ordered-list marker."""
+    if marker.startswith("(") and marker.endswith(")"):
+        value = marker[1:-1]
+    elif marker[-1:] in ".)":
+        value = marker[:-1]
+    else:
+        return None
+    if value.isdecimal():
+        return int(value)
+    if not re.fullmatch(ROMAN_NUMERAL, value, re.IGNORECASE):
+        return None
+    numerals = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
+    total, previous = 0, 0
+    for char in reversed(value.upper()):
+        current = numerals[char]
+        total += -current if current < previous else current
+        previous = max(previous, current)
+    return total
+
+
+def roman_marker_style(marker: str) -> str | None:
+    """Return whether a marker is Roman, preserving its source case."""
+    if marker.startswith("(") and marker.endswith(")"):
+        value = marker[1:-1]
+    elif marker[-1:] in ".)":
+        value = marker[:-1]
+    else:
+        return None
+    if not re.fullmatch(ROMAN_NUMERAL, value, re.IGNORECASE):
+        return None
+    return "I" if value[:1].isupper() else "i"
 
 
 
@@ -526,7 +566,9 @@ class Converter:
         for i, l in enumerate(lines):
             t = clean(line_text(l)).strip()
             m_b, m_n = BULLET_RE.match(t), NUM_RE.match(t)
-            m = m_b or (m_n if (i == 0 or in_num) else None)
+            roman_marker = bool(m_n and roman_marker_style(m_n.group(1)))
+            # Roman markers may follow introductory prose in the same PDF block.
+            m = m_b or (m_n if (i == 0 or in_num or roman_marker) else None)
             if m:
                 groups.append({"prefix": m.group(1), "lines": [l], "plen": m.end()})
                 in_num = bool(m_n and not m_b)
@@ -546,8 +588,12 @@ class Converter:
             kind = "p"
             if g["prefix"]:
                 kind, p = "li", g["prefix"]
-                if re.fullmatch(r"\d{1,2}[.)]", p):
-                    text = f"{p[:-1]}. {text}"
+                number = ordered_marker_number(p) if ORDERED_MARKER_RE.fullmatch(p) else None
+                if roman_marker_style(p):
+                    # Keep Roman markers exactly as they appear in the source PDF.
+                    text = f"{p} {text}"
+                elif number is not None:
+                    text = f"{number}. {text}"
                 elif p.startswith("("):
                     text = f"- {p} {text}"
                 else:
@@ -628,19 +674,18 @@ class Converter:
                 alt = f"Figure on page {it.page}"
                 if nxt and nxt.kind == "p" and CAPTION_RE.match(nxt.text):
                     alt = re.sub(r"[\[\]\*\\]", "", nxt.text)[:120]
-                s = f"![{alt}]({quote(self.assets.name)}/{quote(it.text)})"
+                text = f"![{alt}]({quote(self.assets.name)}/{quote(it.text)})"
             elif it.kind == "code":
-                s = "```\n" + it.text + "\n```"
+                text = "```\n" + it.text + "\n```"
             else:
-                s = it.text
-            parts.append((it.kind, s))
+                text = it.text
+            parts.append((it.kind, text))
         out = ""
-        for i, (k, s) in enumerate(parts):
+        for i, (kind, text) in enumerate(parts):
             if i:
-                out += "\n" if (k == "li" and parts[i - 1][0] == "li") else "\n\n"
-            out += s
+                out += "\n" if (kind == "li" and parts[i - 1][0] == "li") else "\n\n"
+            out += text
         return out + "\n"
-
     # ---- public ------------------------------------------------------------------
     def convert(self, pdf: Path, out_dir: Path) -> Path:
         doc = pymupdf.open(pdf)
