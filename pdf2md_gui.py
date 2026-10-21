@@ -7,9 +7,9 @@ import threading
 from argparse import Namespace
 from pathlib import Path
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
-from pdf2md import Converter, installed_ocr_languages
+from pdf2md import Cancelled, Converter, PasswordRequired, installed_ocr_languages
 
 
 class Pdf2MdApp(ttk.Frame):
@@ -19,16 +19,21 @@ class Pdf2MdApp(ttk.Frame):
         super().__init__(master, padding=18)
         self.master = master
         self.selected: list[Path] = []
-        self.events: queue.Queue[tuple[str, str]] = queue.Queue()
+        self.events: queue.Queue = queue.Queue()
+        self.cancel_requested = threading.Event()
+        self.is_running = False
+        self.closing_after_cancel = False
         self.output_dir = tk.StringVar()
         self.ocr = tk.StringVar(value="auto")
         self.ocr_lang = tk.StringVar(value="eng")
         self.tables = tk.StringVar(value="auto")
         self.images = tk.BooleanVar(value=True)
         self.dpi = tk.IntVar(value=150)
-        self.status = tk.StringVar(value="Choose one or more PDF files to begin.")
+        self.ocr_languages = tuple(installed_ocr_languages()) or ("eng",)
+        self.status = tk.StringVar(value=(f"Tesseract languages: {', '.join(self.ocr_languages)}" if self.ocr_languages != ("eng",) else "OCR unavailable: install Tesseract for scanned PDFs."))
 
         master.title("PDF to Markdown")
+        master.protocol("WM_DELETE_WINDOW", self._on_close)
         master.minsize(680, 460)
         self.grid(sticky="nsew")
         master.columnconfigure(0, weight=1)
@@ -70,7 +75,7 @@ class Pdf2MdApp(ttk.Frame):
         ttk.Label(options, text="Figure DPI:").grid(row=1, column=0, pady=(8, 0), sticky="w")
         ttk.Spinbox(options, from_=72, to=600, increment=25, textvariable=self.dpi, width=8).grid(row=1, column=1, padx=(6, 18), pady=(8, 0), sticky="w")
         ttk.Label(options, text="OCR language(s), or auto:").grid(row=1, column=2, pady=(8, 0), sticky="w")
-        ttk.Combobox(options, textvariable=self.ocr_lang, values=tuple(installed_ocr_languages()) or ("eng",), width=16).grid(row=1, column=3, columnspan=2, padx=(6, 0), pady=(8, 0), sticky="w")
+        ttk.Combobox(options, textvariable=self.ocr_lang, values=self.ocr_languages, width=16).grid(row=1, column=3, columnspan=2, padx=(6, 0), pady=(8, 0), sticky="w")
 
         footer = ttk.Frame(self)
         footer.grid(row=4, column=0, pady=(16, 0), sticky="ew")
@@ -130,7 +135,7 @@ class Pdf2MdApp(ttk.Frame):
             self.status.set("Figure DPI must be between 72 and 600.")
             return
         args = Namespace(dpi=dpi, image_format="png", images=self.images.get(),
-                         tables=self.tables.get(), ocr=self.ocr.get(), ocr_lang=self.ocr_lang.get().strip() or "auto",
+                         tables=self.tables.get(), ocr=self.ocr.get(), ocr_lang=self.ocr_lang.get().strip() or "eng",
                          page_markers=False, keep_headers=False, merge_gap=8, min_fig=36)
         self._set_busy(True)
         self.status.set("Starting conversion…")
@@ -141,9 +146,25 @@ class Pdf2MdApp(ttk.Frame):
         for number, pdf in enumerate(files, 1):
             self.events.put(("status", f"Converting {number} of {len(files)}: {pdf.name}"))
             try:
-                completed.append(Converter(args).convert(pdf, output))
+                password = None
+                while True:
+                    try:
+                        completed.append(Converter(args, on_event=lambda message: self.events.put(("status", message)), cancel=self.cancel_requested.is_set).convert(pdf, output, password=password))
+                        break
+                    except PasswordRequired:
+                        reply = queue.Queue(maxsize=1)
+                        self.events.put(("password", (pdf, reply)))
+                        password = reply.get()
+                        if password is None:
+                            failures.append(f"{pdf.name}: password was not provided")
+                            break
+                    except Cancelled:
+                        failures.append(f"{pdf.name}: cancelled")
+                        break
             except Exception as exc:  # individual PDFs should not stop the batch
                 failures.append(f"{pdf.name}: {exc}")
+            if self.cancel_requested.is_set():
+                break
         if failures:
             detail = "\n".join(failures)
             self.events.put(("error", f"Converted {len(completed)} file(s).\n\nCould not convert:\n{detail}"))
